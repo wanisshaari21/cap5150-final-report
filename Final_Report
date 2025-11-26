@@ -1,0 +1,421 @@
+'''
+Author: Wanis Alshaari
+Final Report
+CAP5150
+'''
+# Imports
+import os
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+from torchvision.utils import make_grid
+import torch.optim as optim
+
+# Function for creating the FGSM attack example
+def fgsm(model, images, labels, epsilon, device):
+    images = images.to(device)
+    labels = labels.to(device)
+
+    images.requires_grad = True
+
+    # Go through all of the original images and calculate the loss
+    outputs = model(images)
+    original_predictions = outputs.argmax(dim=1)
+    original_confidences = F.softmax(outputs, dim=1).max(dim=1)[0]
+
+    loss = criterion(outputs, labels)
+
+    # Get their gradients and sign
+    model.zero_grad()
+    loss.backward()
+
+    data_gradients = images.grad.data
+    sign_gradients = data_gradients.sign()
+
+    # Make the adversarial attack
+    perturbed_images = images + epsilon * sign_gradients
+    perturbed_images = torch.clamp(perturbed_images, 0, 1)
+
+    # Go through all of the malicious images
+    adversarial_output = model(perturbed_images.detach())
+    adversarial_predictions = adversarial_output.argmax(dim=1)
+    adversarial_confidences = F.softmax(adversarial_output, dim=1).max(dim=1)[0]
+
+
+    return (perturbed_images.detach(),
+            original_predictions,
+            adversarial_predictions,
+            original_confidences.detach(),
+            adversarial_confidences.detach())
+
+# Function for making the PGD example
+def pgd(model, images, labels, epsilon, alpha, iterations, device):
+    images = images.to(device)
+    labels = labels.to(device)
+
+    # Get the original predictions and images
+    outputs = model(images)
+    original_predictions = outputs.argmax(dim=1)
+    original_confidences = F.softmax(outputs, dim=1).max(dim=1)[0]
+    attacked_images = images.clone().detach()
+
+    # Perform the attack per iteration
+    for i in range(iterations):
+        attacked_images.requires_grad = True
+
+        # Go through all of the original images and calculate the loss
+        outputs = model(attacked_images)
+        loss = criterion(outputs, labels)
+        model.zero_grad()
+        loss.backward()
+
+        data_grad = attacked_images.grad.data
+        attacked_images = attacked_images + alpha * data_grad.sign()
+
+        perturbation = torch.clamp(attacked_images - images, -epsilon, epsilon)
+        attacked_images = torch.clamp(images + perturbation, 0, 1).detach()
+
+    # Get the attack predictions
+    adversarial_output = model(attacked_images)
+    adversarial_predictions = adversarial_output.argmax(dim=1)
+    adversarial_confidences = F.softmax(adversarial_output, dim=1).max(dim=1)[0]
+
+    return (attacked_images.detach(),
+            original_predictions,
+            adversarial_predictions,
+            original_confidences.detach(),
+            adversarial_confidences.detach())
+
+# Feature squeezing defense method
+def feature_squeeze(images, bit_depth=5):
+    max_value = 2 ** bit_depth
+
+    squeezed = torch.round(images * max_value) / max_value
+
+    squeezed = torch.clamp(squeezed, 0, 1)
+
+    return squeezed
+
+# Defining the LeNet5 model
+class LeNet5(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 6, kernel_size=5)
+        self.pool1 = nn.AvgPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, kernel_size=5)
+        self.pool2 = nn.AvgPool2d(2, 2)
+        self.fc1   = nn.Linear(16*4*4, 120)
+        self.fc2   = nn.Linear(120, 84)
+        self.fc3   = nn.Linear(84, num_classes)
+
+    def forward(self, x):
+        x = torch.tanh(self.conv1(x))
+        x = self.pool1(x)
+        x = torch.tanh(self.conv2(x))
+        x = self.pool2(x)
+        x = x.view(x.size(0), -1)
+        x = torch.tanh(self.fc1(x))
+        x = torch.tanh(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
+device = torch.device("cuda")
+model = LeNet5(num_classes=10).to(device)
+
+# Path
+data_directory = "/content/data"
+
+# Variables
+batch_size = 64
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+rounds = 2
+epsilons = [0.0, 0.05, 0.1, 0.2, 0.3]
+pgd_iterations = 40
+pgd_alpha = 0.01
+results = 0
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+])
+
+
+# Build the training and test datasets
+train_ds = datasets.MNIST(root=data_directory, download=True, train=True, transform=transform)
+test_ds  = datasets.MNIST(root=data_directory, download=True, train=False, transform=transform)
+
+
+# Load the training and test data
+train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+test_loader  = DataLoader(test_ds, batch_size=batch_size)
+
+# Training our model
+for round in range(rounds):
+    model.train()
+    running_loss = 0.0
+
+    # Pass in all of the images
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+
+
+# Testing the accuracy of our model
+model.eval()
+correct = total = 0
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        preds = model(images).argmax(1)
+        correct += (preds == labels).sum().item()
+        total   += labels.size(0)
+print(f"Test accuracy: {100*correct/total:.2f}%")
+
+############################
+# FGSM experiments
+print("Running FGSM experiments")
+
+model.eval()
+results = []
+saved_image = None
+# Test FGSM for each different epsilon values
+for epsilon in epsilons:
+    correct = 0
+    total = 0
+    confidence_change = 0.0
+
+    for index, (images, labels) in enumerate(test_loader):
+        # Perform FGSM on each image
+        attacked_images, original_predictions, attacked_predictions, original_confidence, attacked_confidence = fgsm(model, images, labels, epsilon, device)
+
+        correct += (attacked_predictions == labels.to(device)).sum().item()
+        total += labels.size(0)
+        confidence_change += (original_confidence - attacked_confidence).sum().item()
+
+        # Save one image to print it
+        if index == 0 and saved_image is None:
+            saved_image = (images[0:1].cpu(), labels[0:1])
+
+    accuracy = 100 * correct / total
+    success_rate = 100 - accuracy
+    avg_conf_change = confidence_change / total
+
+    results.append({
+        'epsilon': epsilon,
+        'accuracy': accuracy
+    })
+
+    # Print results
+    print(f"Epsilon {epsilon}: Accuracy = {accuracy:.2f}% | Success Rate = {success_rate:.2f}% | Average Confidence Change = {avg_conf_change:.4f}")
+
+
+# Show the one image as example for epsilon 0.3
+images, labels = next(iter(test_loader))
+perturbed_imgs, _, adv_preds, _, _ = fgsm(model, images, labels, 0.3, device)
+fig, axes = plt.subplots(1, 2, figsize=(6, 3))
+axes[0].imshow(images[0].squeeze(), cmap='gray')
+axes[0].set_title(f'The original predicted: {labels[0].item()}')
+axes[0].axis('off')
+axes[1].imshow(perturbed_imgs[0].cpu().squeeze(), cmap='gray')
+axes[1].set_title(f'The after predicted: {adv_preds[0].item()}')
+axes[1].axis('off')
+
+plt.suptitle('FGSM example attack using epsilon = 0.3', fontsize=12)
+plt.tight_layout()
+plt.show()
+
+# Making the plot for FGSM
+epsilon_values = [r['epsilon'] for r in results]
+accuracy = [r['accuracy'] for r in results]
+
+plt.figure(figsize=(8, 5))
+plt.plot(epsilon_values, accuracy, 'bo-', linewidth=2, markersize=8, label='After Attack')
+
+plt.xlabel('Epsilon', fontsize=12)
+plt.ylabel('Accuracy', fontsize=12)
+plt.title('FGSM Adversarial Attack', fontsize=14)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+############################
+# PGD experiments
+print("\nRunning PGD experiments")
+
+model.eval()
+pgd_results = []
+
+# Test PGD for different epsilon values
+for epsilon in epsilons:
+    correct = 0
+    total = 0
+    confidence_change = 0.0
+
+    for index, (images, labels) in enumerate(test_loader):
+        # Perform PGD on each image
+        attacked_images, original_predictions, attacked_predictions, original_confidence, attacked_confidence = pgd(
+            model, images, labels, epsilon, pgd_alpha, pgd_iterations, device
+        )
+
+        correct += (attacked_predictions == labels.to(device)).sum().item()
+        total += labels.size(0)
+        confidence_change += (original_confidence - attacked_confidence).sum().item()
+
+    accuracy = 100 * correct / total
+    success_rate = 100 - accuracy
+    avg_conf_change = confidence_change / total
+
+    pgd_results.append({
+        'epsilon': epsilon,
+        'accuracy': accuracy
+    })
+
+    # Print results
+    print(f"Epsilon {epsilon}: Accuracy = {accuracy:.2f}% | Success Rate = {success_rate:.2f}% | Average Confidence Change = {avg_conf_change:.4f}")
+
+# Show one image example for PGD with epsilon 0.3
+images, labels = next(iter(test_loader))
+perturbed_imgs, _, adv_preds, _, _ = pgd(model, images, labels, 0.3, pgd_alpha, pgd_iterations, device)
+
+fig, axes = plt.subplots(1, 2, figsize=(6, 3))
+
+axes[0].imshow(images[0].squeeze(), cmap='gray')
+axes[0].set_title(f'The original predicted: {labels[0].item()}')
+axes[0].axis('off')
+
+axes[1].imshow(perturbed_imgs[0].cpu().squeeze(), cmap='gray')
+axes[1].set_title(f'The after predicted: {adv_preds[0].item()}')
+axes[1].axis('off')
+
+plt.suptitle('PGD example attack using epsilon = 0.3', fontsize=12)
+plt.tight_layout()
+plt.show()
+
+# Making the plot for PGD
+epsilon_values_pgd = [r['epsilon'] for r in pgd_results]
+accuracy_pgd = [r['accuracy'] for r in pgd_results]
+
+plt.figure(figsize=(8, 5))
+plt.plot(epsilon_values_pgd, accuracy_pgd, 'ro-', linewidth=2, markersize=8, label='After Attack')
+
+plt.xlabel('Epsilon', fontsize=12)
+plt.ylabel('Accuracy', fontsize=12)
+plt.title('PGD Adversarial Attack', fontsize=14)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+############################
+# FGSM with Feature Squeezing Defense
+print("\nRunning FGSM with Feature Squeezing experiments")
+
+model.eval()
+fgsm_defense_results = []
+
+# Test FGSM with defense for each epsilon
+for epsilon in epsilons:
+    correct = 0
+    total = 0
+    confidence_change = 0.0
+
+    for index, (images, labels) in enumerate(test_loader):
+        # Perform FGSM attack
+        attacked_images, original_predictions, _, original_confidence, _ = fgsm(model, images, labels, epsilon, device)
+
+        # Apply feature squeezing defense
+        defended_images = feature_squeeze(attacked_images, bit_depth=5)
+
+        # Get predictions from the defended images
+        defended_outputs = model(defended_images.to(device))
+        defended_predictions = defended_outputs.argmax(dim=1)
+        defended_confidence = F.softmax(defended_outputs, dim=1).max(dim=1)[0]
+
+        correct += (defended_predictions == labels.to(device)).sum().item()
+        total += labels.size(0)
+        confidence_change += (original_confidence - defended_confidence).sum().item()
+
+    accuracy = 100 * correct / total
+    success_rate = 100 - accuracy
+    avg_conf_change = confidence_change / total
+
+    fgsm_defense_results.append({
+        'epsilon': epsilon,
+        'accuracy': accuracy
+    })
+
+    print(f"Epsilon {epsilon}: Accuracy = {accuracy:.2f}% | Success Rate = {success_rate:.2f}% | Average Confidence Change = {avg_conf_change:.4f}")
+
+
+############################
+# PGD with Feature Squeezing Defense
+print("\nRunning PGD with Feature Squeezing experiments")
+
+model.eval()
+pgd_defense_results = []
+
+# Test PGD with defense for each epsilon
+for epsilon in epsilons:
+    correct = 0
+    total = 0
+    confidence_change = 0.0
+
+    for index, (images, labels) in enumerate(test_loader):
+        # Perform PGD attack
+        attacked_images, original_predictions, _, original_confidence, _ = pgd(
+            model, images, labels, epsilon, pgd_alpha, pgd_iterations, device
+        )
+
+        # Apply feature squeezing defense
+        defended_images = feature_squeeze(attacked_images, bit_depth=5)
+
+        # Get predictions on defended images
+        defended_outputs = model(defended_images.to(device))
+        defended_predictions = defended_outputs.argmax(dim=1)
+        defended_confidence = F.softmax(defended_outputs, dim=1).max(dim=1)[0]
+
+        correct += (defended_predictions == labels.to(device)).sum().item()
+        total += labels.size(0)
+        confidence_change += (original_confidence - defended_confidence).sum().item()
+
+    accuracy = 100 * correct / total
+    success_rate = 100 - accuracy
+    avg_conf_change = confidence_change / total
+
+    pgd_defense_results.append({
+        'epsilon': epsilon,
+        'accuracy': accuracy
+    })
+
+    print(f"Epsilon {epsilon}: Accuracy = {accuracy:.2f}% | Success Rate = {success_rate:.2f}% | Average Confidence Change = {avg_conf_change:.4f}")
+
+
+
+# Making the plot for PGD with defense
+epsilon_values_pgd_defense = [r['epsilon'] for r in pgd_defense_results]
+accuracy_pgd_defense = [r['accuracy'] for r in pgd_defense_results]
+
+plt.figure(figsize=(8, 5))
+plt.plot(epsilon_values_pgd, accuracy_pgd, 'ro-', linewidth=2, markersize=8, label='PGD (No Defense)')
+plt.plot(epsilon_values_pgd_defense, accuracy_pgd_defense, 'go-', linewidth=2, markersize=8, label='PGD + Feature Squeezing')
+
+plt.xlabel('Epsilon', fontsize=12)
+plt.ylabel('Accuracy', fontsize=12)
+plt.title('PGD Attack: With vs Without Defense', fontsize=14)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
